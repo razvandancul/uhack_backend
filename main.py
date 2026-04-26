@@ -6,6 +6,7 @@ ScoutIQ U Cluj — FastAPI Backend v3
 - Search cu filtre din UI (/api/search/advanced)
 - Scout report cu cache 1h
 - Cache stats/players (5x mai rapid)
+- Growth Potential score (0-100) în search + profile DTO
 """
 
 from fastapi import FastAPI, HTTPException
@@ -27,7 +28,7 @@ db = firestore.client()
 
 GEMINI_API_KEY = "AQ.Ab8RN6LqIBCvyqtYWOygu8Xrv3GpSJctf1xGI-P-vkKtRuI2SQ"
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL = "gemini-3-flash-preview" # gemini-3-flash-preview, gemini-2.5-flash, gemini-2.0-flash-001
+MODEL = "gemini-3-flash-preview"
 
 app = FastAPI(title="ScoutIQ U Cluj API v3")
 app.add_middleware(
@@ -97,20 +98,21 @@ def gemini_call(prompt, expect_json=False, system=None):
 
 
 # ── SYSTEM PROMPTS ───────────────────────────────────────────
-CHAT_SYSTEM = """Ești un scout AI pentru FC Universitatea Cluj cu acces la baza de date Liga 1 România 2024/25.
+CHAT_SYSTEM = """Ești un scout AI pentru FC Universitatea Cluj. Răspunzi STRICT pe baza datelor furnizate în prompt.
 
-Reguli:
-1. Folosește datele furnizate — sunt date REALE despre jucători români din Liga 1.
-2. Răspunde natural, conversațional, ca un coleg de scouting.
-3. Citează cifrele exacte (goluri, asisturi, rating, valoare piață).
-4. NU inventa nume care nu apar în date.
-5. NU compara cu Messi/Ronaldo/jucători din alte ligi.
-6. Răspunsuri 2-4 fraze, prietenos dar profesionist.
-7. Vorbește în română, ton de scout cu experiență.
-8. Dacă userul întreabă ceva general legat de fotbal, răspunde scurt și prietenos."""
+REGULI ABSOLUTE — nu le încălca niciodată:
+1. Vorbești DOAR despre jucătorii menționați explicit în datele din prompt.
+2. Dacă userul întreabă despre un jucător specific, discuți NUMAI despre acel jucător — nu sugera alții dacă nu ți s-a cerut.
+3. NU inventa jucători, cluburi, statistici sau transferuri care nu apar în date.
+4. NU spune niciodată că "există X jucători care ar putea completa lotul" dacă nu ai o listă concretă.
+5. Dacă datele nu conțin informația cerută, spune: "Nu am date suficiente despre acest subiect."
+6. Citează NUMAI cifrele exacte din datele furnizate.
+7. Răspunsuri 2-3 fraze, concise și la obiect.
+8. Limba română, ton de scout profesionist."""
 
 SUMMARY_SYSTEM = """Scrie rezumate scurte de scouting după căutare în baza de date.
-Reguli: cifre exacte din lista furnizată, 2-3 fraze, română, ton profesionist."""
+Reguli: cifre exacte din lista furnizată, 2-3 fraze, română, ton profesionist.
+NU inventa jucători sau statistici care nu sunt în listă."""
 
 
 # ── AGGREGATION ──────────────────────────────────────────────
@@ -260,6 +262,73 @@ def calculate_compatibility(totals, matches, role_code, query_filters, exact_nam
     return round(min(100.0, base + min(pa/100*30, 30)), 1)
 
 
+# ── GROWTH POTENTIAL ─────────────────────────────────────────
+def calculate_growth_potential(age, season_rating, totals, matches, behavior_coefficient):
+    """
+    Scor 0–100 pentru TOȚI jucătorii, care reflectă potențialul de creștere
+    sau de menținere a valorii. Apare în UI cu label contextual bazat pe vârstă.
+
+    Componente:
+      A. Rating curent         (40 pts) — performanța prezentă e baza
+      B. Bonus vârstă          (35 pts) — tinerii au plafon mai mare; veteranii pot fi buni dar scor mai mic
+      C. Comportament          (15 pts) — disciplina susține evoluția
+      D. Consistență meciuri   (10 pts) — regularitatea în sezon
+
+    Interpretare scor:
+      ≥ 75  → "⚡ Top Prospect"   (tânăr + performanță ridicată)
+      ≥ 55  → "🌱 Talent"         (în creștere, potențial clar)
+      ≥ 35  → "📊 Consolidat"     (jucător stabil, valoare actuală)
+      <  35 → "🔻 În declin"      (vârstă înaintată + performanță scăzută)
+    """
+    if matches == 0 or season_rating is None:
+        return None
+
+    score = 0.0
+
+    # ── A. RATING CURENT (max 40 pts) ───────────────────────
+    # Normalizăm rating (1–10) → (0–1) și scalăm.
+    # Un rating de 7.0 dă ~33 pts; 8.5 dă ~39 pts; 5.0 dă ~22 pts.
+    rating_norm = max(0.0, (season_rating - 1.0) / 9.0)
+    score += rating_norm * 40.0
+
+    # ── B. BONUS VÂRSTĂ (max 35 pts) ────────────────────────
+    # Curba reflectă fereastra de creștere reală din fotbal:
+    #   ≤ 19 ani → 35 pts (talent pur, tot plafon disponibil)
+    #   20–21    → 32 pts
+    #   22–23    → 27 pts (U23, target principal de scouting)
+    #   24–26    → 18 pts (prime years, creștere limitată dar reală)
+    #   27–29    → 8 pts  (maturitate, stabilitate)
+    #   30–32    → 2 pts  (veteran, valoare decrescătoare)
+    #   33+      → 0 pts
+    if age <= 19:
+        age_bonus = 35.0
+    elif age <= 21:
+        age_bonus = 35.0 - (age - 19) * 1.5      # 35 → 32
+    elif age <= 23:
+        age_bonus = 32.0 - (age - 21) * 2.5      # 32 → 27
+    elif age <= 26:
+        age_bonus = 27.0 - (age - 23) * 3.0      # 27 → 18
+    elif age <= 29:
+        age_bonus = 18.0 - (age - 26) * 3.33     # 18 → 8
+    elif age <= 32:
+        age_bonus = 8.0 - (age - 29) * 2.0       # 8 → 2
+    else:
+        age_bonus = max(0.0, 2.0 - (age - 32) * 1.0)
+
+    score += age_bonus
+
+    # ── C. COMPORTAMENT (max 15 pts) ────────────────────────
+    score += (behavior_coefficient / 100.0) * 15.0
+
+    # ── D. CONSISTENȚĂ (max 10 pts) ─────────────────────────
+    # Jucătorii cu mai multe meciuri sunt mai de încredere.
+    # Pragul de referință: 25 meciuri = sezon complet în Superliga.
+    consistency = min(matches / 25.0, 1.0)
+    score += consistency * 10.0
+
+    return round(min(100.0, max(0.0, score)), 1)
+
+
 # ── DTOs ─────────────────────────────────────────────────────
 def player_search_dto(player_id, query_filters=None, exact_name_match=False):
     p = get_player_doc(player_id)
@@ -281,12 +350,16 @@ def player_search_dto(player_id, query_filters=None, exact_name_match=False):
         if k in main_pos: position_code = c; break
 
     full_name = f"{p.get('firstName','')} {p.get('lastName','').strip()}".strip() or p.get("shortName", "—")
+    age = calculate_age(p.get("birthDate", ""))
+    season_rating = calculate_season_rating_for_player(player_id, role_code)
+    behavior = calculate_behavior_coefficient(totals, matches, role_code)
+    growth = calculate_growth_potential(age, season_rating, totals, matches, behavior)
 
     return {
         "id": p.get("wyId"),
         "name": full_name,
         "club": p.get("tmClub") or f"Team_{p.get('currentTeamId','')}",
-        "age": calculate_age(p.get("birthDate","")),
+        "age": age,
         "nationality": p.get("birthArea", {}).get("name", "—"),
         "position": position_code,
         "mainPosition": main_pos,
@@ -295,9 +368,10 @@ def player_search_dto(player_id, query_filters=None, exact_name_match=False):
         "matches": matches,
         "goals": int(totals.get("goals", 0)),
         "assists": int(totals.get("assists", 0)),
-        "rating": calculate_season_rating_for_player(player_id, role_code),
-        "behaviorCoefficient": calculate_behavior_coefficient(totals, matches, role_code),
+        "rating": season_rating,
+        "behaviorCoefficient": behavior,
         "compatibilityScore": calculate_compatibility(totals, matches, role_code, query_filters, exact_name_match),
+        "growthPotential": growth,
         "status": "monitorizat",
     }
 
@@ -333,12 +407,15 @@ def player_profile_dto(player_id):
 
     overall = round(sum(r["rating"] for r in season_ratings) / max(len(season_ratings),1), 1) if season_ratings else None
     full_name = f"{p.get('firstName','')} {p.get('lastName','').strip()}".strip() or p.get("shortName", "—")
+    age = calculate_age(p.get("birthDate", ""))
+    behavior = calculate_behavior_coefficient(totals, matches, role_code)
+    growth = calculate_growth_potential(age, overall, totals, matches, behavior)
 
     return {
         "id": p.get("wyId"),
         "name": full_name,
         "shortName": p.get("shortName",""),
-        "age": calculate_age(p.get("birthDate","")),
+        "age": age,
         "nationality": p.get("birthArea", {}).get("name", "—"),
         "club": p.get("tmClub") or f"Team_{p.get('currentTeamId','')}",
         "position": agg["main_position"] or p.get("role", {}).get("name", "—"),
@@ -348,6 +425,7 @@ def player_profile_dto(player_id):
         "marketValue": fmt_market_value(p.get("marketValueEur", 0)),
         "marketValueRaw": p.get("marketValueEur", 0),
         "rating": overall,
+        "growthPotential": growth,
         "stats": {
             "matches": matches, "minutes": int(totals.get("minutesOnField",0)),
             "goals": int(totals.get("goals",0)), "assists": int(totals.get("assists",0)),
@@ -416,7 +494,11 @@ def is_name_query(query):
     q = query.strip().lower()
     exclude = ["atacant","fundas","fundaș","mijlocas","mijlocaș","portar","tanar","tânăr",
                "sub","peste","ani","goluri","asisturi","creativ","rapid","ieftin","buget",
-               "cu ","fara","fără","min ","max ","centra","stang","drept","young","old"]
+               "cu ","fara","fără","min ","max ","centra","stang","drept","young","old",
+               "spune","despre","jucatorul","jucătorul","nostru","echipa","echipă",
+               "poti","poți","ceva","informatii","informații",
+               "potential","potențial","prospect","talent","crestere","creștere",
+               "viitor","promitator","promițător","growth"]
     for kw in exclude:
         if kw in q: return False
     if len(q.split()) > 4: return False
@@ -430,6 +512,14 @@ def extract_filters_from_query(query):
 
 Query: "{query}"
 
+IMPORTANT pentru min_growth_potential:
+- "potențial mare/ridicat/bun/top" → 70
+- "potențial mediu" → 50
+- "tineri cu potențial" → 65
+- "cei mai promițători/prospect/talent" → 70
+- "jucători în creștere" → 60
+- dacă nu se menționează potențial → null
+
 Format (null pentru irelevante):
 {{"role_code": "MID/FWD/DEF/GKP sau null", "nationality": "țara în engleză sau null",
 "age_max": număr sau null, "age_min": număr sau null,
@@ -437,7 +527,9 @@ Format (null pentru irelevante):
 "min_matches": număr sau null, "min_pass_percent": număr sau null,
 "min_height_cm": număr sau null, "max_market_value_eur": număr sau null,
 "min_market_value_eur": număr sau null, "preferred_foot": "left/right/both sau null",
-"position_keyword": "ex: Striker, Left Back sau null"}}"""
+"position_keyword": "ex: Striker, Left Back sau null",
+"min_growth_potential": număr 0-100 sau null,
+"sort_by_growth": true dacă se cere explicit sortare după potențial, altfel false}}"""
     text = gemini_call(prompt, expect_json=True)
     try: return json.loads(text)
     except: return {}
@@ -482,9 +574,26 @@ def retrieve_players(filters, query=None, limit=30):
             if filters["position_keyword"].lower() not in agg["main_position"].lower(): continue
 
         dto = player_search_dto(p["wyId"], query_filters=filters)
-        if dto: results.append(dto)
+        if not dto: continue
 
-    results.sort(key=lambda x: ((x.get("compatibilityScore") or 0)*0.5 + (x.get("rating") or 0)*5), reverse=True)
+        # Filtrare după growth potential — calculat deja în DTO
+        if filters.get("min_growth_potential"):
+            gp = dto.get("growthPotential")
+            if gp is None or gp < filters["min_growth_potential"]:
+                continue
+
+        results.append(dto)
+
+    # Sortare: dacă s-a cerut explicit potențial → sortăm după growthPotential desc
+    # Altfel → sortarea standard după compatibilitate + rating
+    if filters.get("sort_by_growth") or filters.get("min_growth_potential"):
+        results.sort(key=lambda x: (x.get("growthPotential") or 0), reverse=True)
+    else:
+        results.sort(
+            key=lambda x: ((x.get("compatibilityScore") or 0) * 0.5 + (x.get("rating") or 0) * 5),
+            reverse=True,
+        )
+
     return results[:limit]
 
 
@@ -495,7 +604,6 @@ Returnează DOAR JSON valid."""
 
 
 def build_report_prompt(profile, stats, metrics):
-    def pct(a, b): return round(a/b*100, 1) if b else 0
     return f"""Date REALE jucător:
 Nume: {profile.get('name')} | Poziție: {profile.get('position')} | Vârstă: {profile.get('age')}
 Club: {profile.get('club')} | Valoare: {profile.get('marketValue')}
@@ -604,6 +712,8 @@ class AdvancedSearchRequest(BaseModel):
     min_goals: Optional[int] = None
     min_assists: Optional[int] = None
     min_pass_percent: Optional[float] = None
+    min_growth_potential: Optional[float] = None
+    sort_by_growth: Optional[bool] = False
     limit: Optional[int] = 50
 
 
@@ -635,7 +745,6 @@ def search_players(req: SearchRequest):
     if not query:
         return {"results": [], "ai_summary": "", "filters": {}, "search_type": "none"}
 
-    # Search după nume
     if is_name_query(query):
         name_results = search_by_name(query, max_results=req.limit or 10)
         if name_results:
@@ -646,7 +755,6 @@ def search_players(req: SearchRequest):
                 "search_type": "name",
             }
 
-    # Filter-based
     filters = extract_filters_from_query(query)
     results = retrieve_players(filters, query=query, limit=req.limit or 30)
 
@@ -656,10 +764,10 @@ def search_players(req: SearchRequest):
         lines = [f"- {p['name']} ({p['position']}, {p['age']} ani, {p['club']}): {p['goals']}G/{p['assists']}A în {p['matches']} meciuri, rating {p['rating']}, {p['marketValue']}" for p in top5]
         prompt = f"""Userul caută: "{query}"
 
-Top 5 găsiți (date reale):
+Aceștia sunt SINGURII jucători găsiți în baza de date (date reale):
 {chr(10).join(lines)}
 
-3 fraze: câți s-au găsit + recomandare cu cifre + bargain dacă există."""
+Scrie 2-3 fraze despre acești jucători EXACT. Nu inventa alți jucători."""
         ai_summary = gemini_call(prompt, system=SUMMARY_SYSTEM)
 
     return {
@@ -671,11 +779,11 @@ Top 5 găsiți (date reale):
 
 @app.post("/api/search/advanced")
 def search_advanced(req: AdvancedSearchRequest):
-    """Search cu filtre din UI"""
     filters = {}
     fields = ["role_code","nationality","preferred_foot","age_min","age_max",
               "min_height_cm","min_market_value_eur","max_market_value_eur",
-              "min_matches","min_goals","min_assists","min_pass_percent"]
+              "min_matches","min_goals","min_assists","min_pass_percent",
+              "min_growth_potential","sort_by_growth"]
     for f in fields:
         v = getattr(req, f, None)
         if v is not None and v != "":
@@ -695,29 +803,83 @@ def search_advanced(req: AdvancedSearchRequest):
 def chat_endpoint(req: ChatRequest):
     msg = req.message.strip()
     if not msg:
-        return {"reply": "Salut! Sunt asistentul tău de scouting. Ce cauți?", "players": []}
+        return {"reply": "Salut! Sunt asistentul tău de scouting. Ce jucător vrei să analizăm?", "players": []}
 
-    # Search după nume
-    if is_name_query(msg):
-        nr = search_by_name(msg, max_results=3)
+    # ── 1. Extrage numele din mesaj dacă e întrebare despre un jucător specific ──
+    name_from_context = None
+    msg_lower = msg.lower()
+
+    for pattern in ["despre jucătorul nostru, ", "despre jucătorul ", "despre ", "informatii despre ", "informații despre "]:
+        if pattern in msg_lower:
+            after = msg[msg_lower.index(pattern) + len(pattern):].strip()
+            after = after.rstrip("?.!,")
+            if after and len(after.split()) <= 4:
+                name_from_context = after
+                break
+
+    if name_from_context:
+        nr = search_by_name(name_from_context, max_results=3)
         if nr:
             top = nr[0]
-            others = ""
-            if len(nr) > 1:
-                ot = [f"{p['name']} ({p['club']})" for p in nr[1:]]
-                others = f" Mai există: {', '.join(ot)}."
+            prompt = f"""Userul a întrebat: "{msg}"
+
+DATE REALE din baza de date despre {top['name']}:
+- Club: {top['club']}, Vârstă: {top['age']} ani, Poziție: {top['position']}
+- Sezon: {top['goals']} goluri, {top['assists']} asisturi în {top['matches']} meciuri
+- Rating: {top['rating']}/10, Valoare: {top['marketValue']}
+- Coeficient comportament: {top['behaviorCoefficient']}/100
+- Growth Potential: {top['growthPotential']}/100
+
+Instrucțiuni STRICTE:
+- Vorbește NUMAI despre {top['name']} folosind datele de mai sus.
+- NU sugera alți jucători, NU inventa statistici.
+- 2-3 fraze concise."""
+            return {"reply": gemini_call(prompt, system=CHAT_SYSTEM), "players": [top]}
+
+    # ── 2. Căutare directă după nume ──
+    if is_name_query(msg):
+        nr = search_by_name(msg, max_results=3)
+
+        if nr:
+            top = nr[0]
+            others_list = nr[1:] if len(nr) > 1 else []
+
+            players_context = (
+                f"Jucător: {top['name']}, {top['age']} ani, {top['club']}. "
+                f"Stats sezon: {top['goals']} goluri, {top['assists']} asisturi "
+                f"în {top['matches']} meciuri, rating {top['rating']}/10, "
+                f"valoare {top['marketValue']}, comportament {top['behaviorCoefficient']}/100, "
+                f"growth potential {top['growthPotential']}/100."
+            )
+            if others_list:
+                others_str = ", ".join([f"{p['name']} ({p['club']})" for p in others_list])
+                players_context += f" Alte rezultate cu același nume: {others_str}."
+
             prompt = f"""Userul a căutat: "{msg}"
 
-Jucător găsit: {top['name']}, {top['age']} ani, {top['club']}.
-Stats: {top['goals']} goluri, {top['assists']} asisturi în {top['matches']} meciuri, rating {top['rating']}/10, valoare {top['marketValue']}.
+DATE REALE din baza de date:
+{players_context}
 
-Răspunde 2-3 fraze prezentând jucătorul cu cifre.{others}"""
+Instrucțiuni STRICTE:
+- Prezintă DOAR pe {top['name']} cu cifrele exacte de mai sus.
+- NU adăuga alți jucători care nu sunt în datele de mai sus.
+- NU inventa statistici sau context suplimentar.
+- 2-3 fraze maxim."""
+
             return {"reply": gemini_call(prompt, system=CHAT_SYSTEM), "players": nr}
 
-    # Detectare intent
-    intent_prompt = f'Mesaj: "{msg}"\nE cerere de căutare jucători? JSON: {{"is_search": true/false}}'
-    try: intent = json.loads(gemini_call(intent_prompt, expect_json=True))
-    except: intent = {"is_search": True}
+        else:
+            return {
+                "reply": f"Nu am găsit niciun jucător cu numele '{msg}' în baza de date Liga 1 2024/25. Verifică ortografia sau încearcă numele complet.",
+                "players": []
+            }
+
+    # ── 3. Detectare intent căutare după criterii ──
+    intent_prompt = f'Mesaj: "{msg}"\nE cerere de căutare jucători după criterii (poziție, vârstă, goluri etc.)? JSON: {{"is_search": true/false}}'
+    try:
+        intent = json.loads(gemini_call(intent_prompt, expect_json=True))
+    except:
+        intent = {"is_search": False}
 
     if intent.get("is_search"):
         filters = extract_filters_from_query(msg)
@@ -725,32 +887,39 @@ Răspunde 2-3 fraze prezentând jucătorul cu cifre.{others}"""
 
         if not results:
             return {
-                "reply": "Nu am găsit jucători cu aceste criterii în baza de date. Încearcă alte filtre — schimbă vârsta sau poziția.",
+                "reply": "Nu am găsit jucători cu aceste criterii în baza de date. Încearcă alte filtre — modifică vârsta, poziția sau pragul de goluri.",
                 "players": []
             }
 
         top3 = results[:3]
-        lines = [f"- {p['name']} ({p['position']}, {p['age']} ani, {p['club']}): {p['goals']}G/{p['assists']}A în {p['matches']} meciuri, rating {p['rating']}, valoare {p['marketValue']}, comportament {p['behaviorCoefficient']}" for p in top3]
+        lines = [
+            f"- {p['name']} ({p['position']}, {p['age']} ani, {p['club']}): "
+            f"{p['goals']}G/{p['assists']}A în {p['matches']} meciuri, "
+            f"rating {p['rating']}, valoare {p['marketValue']}"
+            for p in top3
+        ]
 
-        prompt = f"""Userul a întrebat: "{msg}"
+        prompt = f"""Userul a căutat: "{msg}"
 
-Top 3 găsiți (date reale):
+ACEȘTIA SUNT SINGURII {len(results)} jucători găsiți în baza de date:
 {chr(10).join(lines)}
 
-Răspunde natural în 3-4 fraze:
-- Câți jucători potriviți există ({len(results)} total)
-- Cel mai bun cu cifre exacte
-- Bargain dacă există (preț mic + rating bun)
-- Sugerează "click pe Profil" pentru detalii
+Instrucțiuni STRICTE:
+- Menționează NUMAI jucătorii listați mai sus — nu inventa alții.
+- Spune că s-au găsit {len(results)} jucători total.
+- Evidențiază cel cu ratingul cel mai mare și cel mai bun raport preț/calitate din lista de mai sus.
+- 3-4 fraze, ton conversațional de scout."""
 
-Ton conversațional, scout cu experiență."""
         return {"reply": gemini_call(prompt, system=CHAT_SYSTEM), "players": top3}
 
-    # Chat general
-    prompt = f"""Mesaj: "{msg}"
+    # ── 4. Chat general ──
+    prompt = f"""Mesaj utilizator: "{msg}"
 
-Răspunde scurt (1-2 fraze) ca asistent de scouting U Cluj. 
-Dacă vrea sfaturi, cere-i să fie specific. Dacă e conversație, fii prietenos."""
+Răspunde în 1-2 fraze ca asistent de scouting U Cluj.
+Dacă întreabă despre un jucător specific, roagă-l să scrie numele direct.
+Dacă e conversație generală, fii prietenos și scurt.
+NU inventa date sau jucători."""
+
     return {"reply": gemini_call(prompt, system=CHAT_SYSTEM), "players": []}
 
 
@@ -769,8 +938,8 @@ def compare_players(req: CompareRequest):
     pd = [p for p in pd if p]
     if len(pd) < 2: raise HTTPException(404, "Could not load players")
 
-    lines = [f"- {p['name']} ({p['position']}, {p['age']} ani, {p['club']}): {p['goals']}G/{p['assists']}A, rating {p['rating']}, comportament {p['behaviorCoefficient']}/100, {p['marketValue']}" for p in pd]
-    prompt = f"Compară:\n{chr(10).join(lines)}\n\n3 fraze: punctele forte + cel mai bun pentru U Cluj + cel mai bun preț."
+    lines = [f"- {p['name']} ({p['position']}, {p['age']} ani, {p['club']}): {p['goals']}G/{p['assists']}A, rating {p['rating']}, comportament {p['behaviorCoefficient']}/100, growth potential {p['growthPotential']}/100, {p['marketValue']}" for p in pd]
+    prompt = f"Compară NUMAI acești jucători:\n{chr(10).join(lines)}\n\n3 fraze: punctele forte + cel mai bun pentru U Cluj + cel mai bun preț. Nu inventa alți jucători."
     return {"players": pd, "summary": gemini_call(prompt, system=SUMMARY_SYSTEM)}
 
 
