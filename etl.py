@@ -2,12 +2,12 @@ import json
 import os
 import glob
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import firestore
 from collections import defaultdict
 
 # Setup Firebase
-cred = credentials.Certificate("serviceAccountKey.json")
-firebase_admin.initialize_app(cred)
+# Uses Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS locally).
+firebase_admin.initialize_app()
 db = firestore.client()
 
 PLAYERS_JSON = "players.json"

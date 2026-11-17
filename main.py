@@ -14,19 +14,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import json
+import os
 from collections import defaultdict
 from datetime import datetime
 import numpy as np
 
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import firestore
 from google import genai
 
-cred = credentials.Certificate("serviceAccountKey.json")
-firebase_admin.initialize_app(cred)
+# Uses Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS locally).
+firebase_admin.initialize_app()
 db = firestore.client()
 
-GEMINI_API_KEY = "REMOVED_REVOKED_CREDENTIAL"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+if not GEMINI_API_KEY:
+    raise RuntimeError("Set GEMINI_API_KEY before starting the backend.")
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL = "gemini-3-flash-preview"
 

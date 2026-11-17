@@ -1,0 +1,17 @@
+# Local secrets and Google service-account credentials
+.env
+.env.*
+!.env.example
+serviceAccountKey*.json
+*service-account*.json
+*service_account*.json
+application_default_credentials.json
+secrets/
+*.pem
+*.key
+
+# Python environment and generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/

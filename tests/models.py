@@ -1,6 +1,10 @@
+import os
 from google import genai
 
-client = genai.Client(api_key="REMOVED_REVOKED_CREDENTIAL")
+api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+if not api_key:
+    raise RuntimeError("Set GEMINI_API_KEY before listing models.")
+client = genai.Client(api_key=api_key)
 
 models = client.models.list()
 for m in models:
